@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+# data
+data-bin/
+data/
+
 # Distribution / packaging
 .Python
 env/

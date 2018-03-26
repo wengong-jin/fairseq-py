@@ -71,14 +71,17 @@ class FConvModel(FairseqModel):
 class FConvEncoder(FairseqEncoder):
     """Convolutional encoder"""
     def __init__(self, dictionary, embed_dim=512, max_positions=1024,
-                 convolutions=((512, 3),) * 20, dropout=0.1):
+                 convolutions=((512, 3),) * 20, dropout=0.1, embed=True, use_fc=True):
         super().__init__(dictionary)
         self.dropout = dropout
         self.num_attention_layers = None
+        self.embed = embed
 
         num_embeddings = len(dictionary)
         padding_idx = dictionary.pad()
-        self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+        if self.embed:
+            self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+
         self.embed_positions = PositionalEmbedding(
             max_positions,
             embed_dim,
@@ -87,7 +90,11 @@ class FConvEncoder(FairseqEncoder):
         )
 
         in_channels = convolutions[0][0]
-        self.fc1 = Linear(embed_dim, in_channels, dropout=dropout)
+        if use_fc or embed_dim != in_channels:
+            self.fc1 = Linear(embed_dim, in_channels, dropout=dropout)
+        else:
+            self.fc1 = None
+
         self.projections = nn.ModuleList()
         self.convolutions = nn.ModuleList()
         for (out_channels, kernel_size) in convolutions:
@@ -98,16 +105,23 @@ class FConvEncoder(FairseqEncoder):
                         dropout=dropout)
             )
             in_channels = out_channels
-        self.fc2 = Linear(in_channels, embed_dim)
+        if use_fc or in_channels != embed_dim:
+            self.fc2 = Linear(in_channels, embed_dim)
+        else:
+            self.fc2 = None
 
     def forward(self, src_tokens, src_lengths):
         # embed tokens and positions
-        x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        input_embedding = x
+        if self.embed:
+            x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        else:
+            x = src_tokens + self.embed_positions(src_tokens.mean(-1).long())
 
+        input_embedding = x
         # project to size of convolution
-        x = self.fc1(x)
+        if self.fc1 is not None:
+            x = self.fc1(x)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -127,7 +141,8 @@ class FConvEncoder(FairseqEncoder):
         x = x.transpose(1, 0)
 
         # project back to size of embedding
-        x = self.fc2(x)
+        if self.fc2 is not None:
+            x = self.fc2(x)
 
         # scale gradients (this only affects backward, not forward)
         x = GradMultiply.apply(x, 1.0 / (2.0 * self.num_attention_layers))
