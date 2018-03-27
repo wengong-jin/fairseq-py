@@ -184,9 +184,12 @@ class Trainer(object):
             grads = [p.grad.data for p in self.model.parameters() if p.requires_grad]
             distributed_utils.all_reduce_and_rescale_tensors(grads, grad_denom)
         else:
-            for p in self.model.parameters():
+            norms = []
+            for name,p in self.model.named_parameters():
+                #norms.append( (name, p.size(), p.grad.data.norm().item() / p.grad.data.numel()) )
                 if p.requires_grad:
                     p.grad.data.div_(grad_denom)
+            #norms = sorted(norms, key=lambda x:x[2], reverse=True)
 
         # clip grads
         if self.args.clip_norm > 0:

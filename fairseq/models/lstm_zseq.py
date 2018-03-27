@@ -17,16 +17,17 @@ from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding
 
 from . import FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
 from .fconv import FConvEncoder, FConvDecoder
+from .lstm import LSTMDecoder
+from .zseq import LSTM, LSTMCell, Linear, AttentionLayer
 
 
-@register_model('zseq')
-class ZSeqModel(FairseqModel):
+@register_model('lstm_zseq')
+class LSTMZSeqModel(FairseqModel):
     def __init__(self, encoder, decoder, z_encoder, z_decoder):
         super().__init__(encoder, decoder)
         self.z_encoder = z_encoder
         self.z_decoder = z_decoder
-        self.encoder.num_attention_layers = sum(layer is not None for layer in decoder.attention)
-        self.z_encoder.num_attention_layers = 1
+        self.z_encoder.num_attention_layers = 0.5
 
     @staticmethod
     def add_args(parser):
@@ -69,38 +70,81 @@ class ZSeqModel(FairseqModel):
             num_layers = 1
         )
 
-        encoder = FConvEncoder(
+        encoder = LSTMEncoder(
             src_dict, #Just a dummy
             embed_dim=args.encoder_embed_dim,
-            convolutions=eval(args.encoder_layers),
-            dropout=args.dropout,
-            max_positions=args.max_source_positions,
-            embed=False
+            num_layers=1,
+            dropout_in=0,
+            dropout_out=0
         )
 
-        decoder = FConvDecoder(
+        decoder = LSTMDecoder(
             dst_dict,
+            encoder_embed_dim=args.encoder_embed_dim,
             embed_dim=args.decoder_embed_dim,
-            convolutions=eval(args.decoder_layers),
             out_embed_dim=args.decoder_out_embed_dim,
-            attention=eval(args.decoder_attention),
-            dropout=args.dropout,
-            max_positions=args.max_target_positions,
-            share_embed=args.share_input_output_embed
+            num_layers=1,
+            attention=True,
+            dropout_in=0,
+            dropout_out=0
         )
-        
-        return ZSeqModel(encoder, decoder, z_encoder, z_decoder)
+
+        return LSTMZSeqModel(encoder, decoder, z_encoder, z_decoder)
 
     def forward(self, src_tokens, src_lengths, prev_output_tokens):
 
         #src_lengths is actually not used in encoders
-        _,z_encoder_out = self.z_encoder(src_tokens, src_lengths)
-        z_length = z_encoder_out.size()[1] // 2 + 1
+        z_encoder_out,_ = self.z_encoder(src_tokens, src_lengths)
+        z_length = z_encoder_out.size()[1] 
         z_decoder_out = self.z_decoder(z_encoder_out, z_length)
 
         encoder_out = self.encoder(z_decoder_out, src_lengths)
         decoder_out, _ = self.decoder(prev_output_tokens, encoder_out)
         return decoder_out
+
+class LSTMEncoder(FairseqEncoder):
+    """LSTM encoder."""
+    def __init__(self, dictionary, embed_dim=512, num_layers=1, dropout_in=0.1,
+                 dropout_out=0.1):
+        super().__init__(dictionary)
+        self.num_layers = num_layers
+        self.dropout_in = dropout_in
+        self.dropout_out = dropout_out
+
+        self.lstm = LSTM(
+            input_size=embed_dim,
+            hidden_size=embed_dim,
+            num_layers=num_layers,
+            dropout=self.dropout_out,
+            bidirectional=False,
+        )
+
+    def forward(self, src_tokens, src_lengths):
+        bsz, seqlen, embed_dim = src_tokens.size()
+
+        # B x T x C -> T x B x C
+        x = src_tokens.transpose(0, 1)
+
+        # pack embedded source tokens into a PackedSequence
+        packed_x = nn.utils.rnn.pack_padded_sequence(x, src_lengths.data.tolist())
+
+        # apply LSTM
+        h0 = Variable(x.data.new(self.num_layers , bsz, embed_dim).zero_())
+        c0 = Variable(x.data.new(self.num_layers , bsz, embed_dim).zero_())
+        packed_outs, (final_hiddens, final_cells) = self.lstm(
+            packed_x,
+            (h0, c0),
+        )
+
+        # unpack outputs and apply dropout
+        x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=0.)
+        x = F.dropout(x, p=self.dropout_out, training=self.training)
+
+        return x, final_hiddens, final_cells
+
+    def max_positions(self):
+        """Maximum input length supported by the encoder."""
+        return int(1e5)  # an arbitrary large number
 
 class LSTMSampler(nn.Module):
     """LSTM Z Sampler."""
@@ -114,11 +158,11 @@ class LSTMSampler(nn.Module):
             + [LSTMCell(hdim, hdim) for layer in range(1, num_layers)]
         )
         self.attention = AttentionLayer(encoder_hdim, hdim)
-        self.mu_out = Linear(hdim, zdim, dropout=0, bias=False)
-        self.sg_out = Linear(hdim, zdim, dropout=0, bias=False)
+        self.mu_out = Linear(hdim, zdim, dropout=0)
+        self.sg_out = Linear(hdim, zdim, dropout=0)
         #self.W_feed = Linear(2*hdim, hdim, bias=False)
         self.init_z = nn.Parameter(torch.Tensor(zdim).normal_())
-        self.fc = Linear(self.zdim, encoder_hdim, dropout=0, bias=False)
+        self.fc = Linear(self.zdim, encoder_hdim, dropout=0)
 
     def forward(self, encoder_hiddens, seqlen):
         num_layers = len(self.layers)
@@ -134,7 +178,6 @@ class LSTMSampler(nn.Module):
 
         init_z = torch.stack([self.init_z] * bsz, dim=0)
         zouts = [init_z]
-        coverage = Variable(zero.data.new(bsz, encoder_hiddens.size(1)).zero_()).cuda()
         for j in range(seqlen):
             # input feeding: concatenate context vector from previous time step
             #input = torch.cat((zouts[-1], input_feed), dim=1)
@@ -152,8 +195,7 @@ class LSTMSampler(nn.Module):
                 prev_cells[i] = cell
 
             # apply attention using the last layer's hidden state
-            cxt, attn_score = self.attention(hidden, encoder_hiddens, coverage)
-            coverage = coverage + attn_score
+            cxt = self.attention(hidden, encoder_hiddens)
             #out = F.tanh(self.W_feed(torch.cat((cxt, hidden), dim=1)))
 
             cxt = F.dropout(cxt, p=self.dropout, training=self.training)
@@ -165,10 +207,7 @@ class LSTMSampler(nn.Module):
             # sample z from context vector cxt 
             mu = self.mu_out(cxt)
             log_sigma = -torch.abs(self.sg_out(cxt))
-            if self.training:
-                eps = Variable(mu.data.clone().normal_(std=0.1))
-            else:
-                eps = 0
+            eps = Variable(mu.data.clone().normal_(std=0.0001))
             zouts.append( mu + eps * torch.exp(log_sigma / 2) )
 
         # collect outputs across time steps
@@ -176,91 +215,7 @@ class LSTMSampler(nn.Module):
         zouts = self.fc(zouts)
         return zouts.transpose(1, 0) # T x B x C -> B x T x C
 
-class AttentionLayer(nn.Module):
-    """T. Luong's global attention"""
-    def __init__(self, input_embed_dim, output_embed_dim):
-        super().__init__()
-        self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
-
-    def forward(self, input, source_hids, coverage):
-        # input: bsz x input_embed_dim
-        # source_hids: bsz x srclen x output_embed_dim
-        # x: bsz x output_embed_dim
-        x = self.input_proj(input)
-        
-        # compute attention
-        attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
-        attn_scores = attn_scores + torch.log(1 - coverage + 1e-6)
-        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-        attn_scores = attn_scores * (1 - coverage)
-        #if source_hids.size(1) <= 50:
-        #    print(coverage[0])
-        #    print(attn_scores.max(dim=1)[0][0].item())
-        #    print(attn_scores[0])
-
-        # sum weighted sources
-        x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
-        return x, attn_scores
-
-class LocalAttentionLayer(nn.Module):
-    """T. Luong's local-p attention"""
-    def __init__(self, input_embed_dim, output_embed_dim):
-        super().__init__()
-
-        self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
-        self.pos_pred = nn.Sequential(
-                Linear(input_embed_dim, input_embed_dim), 
-                nn.Tanh(), 
-                Linear(input_embed_dim, 1),
-                nn.Sigmoid()
-        )
-
-    def forward(self, input, source_hids):
-        # input: bsz x input_embed_dim
-        # source_hids: bsz x srclen x output_embed_dim
-
-        # x: bsz x output_embed_dim
-        x = self.input_proj(input)
-
-        # compute attention
-        attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
-        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-
-        srclen = source_hids.size(1)
-        mean_pos = self.pos_pred(input) * srclen #bsz * 1
-        all_pos = Variable(torch.Tensor(range(srclen))).cuda()
-        dist = all_pos.unsqueeze(0) - mean_pos
-        
-        gauss_mask = torch.exp( -dist * dist / 2 ) #bsz * srclen
-        attn_scores = attn_scores * gauss_mask 
-
-        # sum weighted sources
-        x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
-        return x
-
-def LSTM(input_size, hidden_size, **kwargs):
-    m = nn.LSTM(input_size, hidden_size, **kwargs)
-    for name, param in m.named_parameters():
-        if 'weight' in name or 'bias' in name:
-            param.data.normal_(mean=0, std=0.1)
-    return m
-
-def LSTMCell(input_size, hidden_size, **kwargs):
-    m = nn.LSTMCell(input_size, hidden_size, **kwargs)
-    for name, param in m.named_parameters():
-        if 'weight' in name or 'bias' in name:
-            param.data.normal_(mean=0, std=0.1)
-    return m
-
-def Linear(in_features, out_features, dropout=0, bias=True):
-    """Weight-normalized Linear layer (input: N x T x C)"""
-    m = nn.Linear(in_features, out_features, bias=bias)
-    m.weight.data.normal_(mean=0, std=0.1)
-    if bias:
-        m.bias.data.zero_()
-    return m
-
-@register_model_architecture('zseq', 'zseq')
+@register_model_architecture('lstm_zseq', 'lstm_zseq')
 def base_architecture(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(512, 3)] * 20')
@@ -271,11 +226,11 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
 
 
-@register_model_architecture('zseq', 'zseq_iwslt_de_en')
+@register_model_architecture('lstm_zseq', 'lstm_zseq_iwslt_de_en')
 def fconv_iwslt_de_en(args):
     base_architecture(args)
     args.encoder_embed_dim = 256
-    args.encoder_layers = '[(256, 3)] * 3'
+    args.encoder_layers = '[(256, 3)] * 4'
     args.decoder_embed_dim = 256
     args.decoder_layers = '[(256, 3)] * 3'
     args.decoder_out_embed_dim = 256
