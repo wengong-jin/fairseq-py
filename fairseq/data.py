@@ -21,7 +21,8 @@ from fairseq.indexed_dataset import IndexedDataset, IndexedInMemoryDataset, Inde
 
 def has_binary_files(data_dir, splits):
     for split in splits:
-        if len(glob.glob(os.path.join(data_dir, '{}.*-*.*.bin'.format(split)))) < 2:
+        #if len(glob.glob(os.path.join(data_dir, '{}.*-*.*.bin'.format(split)))) < 2:
+        if len(glob.glob(os.path.join(data_dir, '{}.*-*.*.bin'.format(split)))) < 1:
             return False
     return True
 

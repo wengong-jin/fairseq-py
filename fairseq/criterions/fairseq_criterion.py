@@ -14,6 +14,7 @@ class FairseqCriterion(_Loss):
         super().__init__()
         self.args = args
         self.padding_idx = dst_dict.pad()
+        self.eos_idx = dst_dict.eos()
 
     @staticmethod
     def add_args(parser):

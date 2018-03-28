@@ -113,6 +113,15 @@ class SequenceGenerator(object):
                 src_tokens.repeat(1, beam_size).view(-1, srclen),
                 src_lengths.repeat(beam_size),
             )
+            """
+            btokens = src_tokens.repeat(1, beam_size).view(-1, srclen)
+            blen = src_lengths.repeat(beam_size)
+            z_encoder_out,_ = model.z_encoder(btokens, blen)
+            z_length = z_encoder_out.size()[1] // 2 + 1
+            z_decoder_out = model.z_decoder(z_encoder_out, z_length)
+            encoder_out = model.encoder(z_decoder_out, blen)
+            """
+
             encoder_outs.append(encoder_out)
 
         # initialize buffers
@@ -122,6 +131,7 @@ class SequenceGenerator(object):
         tokens_buf = tokens.clone()
         tokens[:, 0] = self.eos
         attn = scores.new(bsz * beam_size, src_tokens.size(1), maxlen + 2)
+        #attn = scores.new(bsz * beam_size, z_length, maxlen + 2)
         attn_buf = attn.clone()
 
         # list of completed sentences

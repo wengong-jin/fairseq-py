@@ -92,9 +92,8 @@ class ZSeqModel(FairseqModel):
         return ZSeqModel(encoder, decoder, z_encoder, z_decoder)
 
     def forward(self, src_tokens, src_lengths, prev_output_tokens):
-
         #src_lengths is actually not used in encoders
-        _,z_encoder_out = self.z_encoder(src_tokens, src_lengths)
+        z_encoder_out,_ = self.z_encoder(src_tokens, src_lengths)
         z_length = z_encoder_out.size()[1] // 2 + 1
         z_decoder_out = self.z_decoder(z_encoder_out, z_length)
 
@@ -193,10 +192,8 @@ class AttentionLayer(nn.Module):
         attn_scores = attn_scores + torch.log(1 - coverage + 1e-6)
         attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
         attn_scores = attn_scores * (1 - coverage)
-        #if source_hids.size(1) <= 50:
-        #    print(coverage[0])
-        #    print(attn_scores.max(dim=1)[0][0].item())
-        #    print(attn_scores[0])
+        #xx,yy = attn_scores.max(dim=1)
+        #print(xx[0].item(), yy[0].item())
 
         # sum weighted sources
         x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
