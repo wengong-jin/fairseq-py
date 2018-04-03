@@ -16,13 +16,14 @@ from fairseq.data import LanguagePairDataset
 from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding, LinearizedConvolution
 
 from . import FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
-from .fconv import FConvEncoder, FConvDecoder
+from .fconv import Embedding, PositionalEmbedding, FConvEncoder, FConvDecoder
+from .uni_model import UniSeqModel
 
 
-@register_model('zseq')
-class ZSeqModel(FairseqModel):
-    def __init__(self, encoder, decoder, z_encoder, z_decoder):
-        super().__init__(encoder, decoder)
+@register_model('uni_zword')
+class UniZWordModel(UniSeqModel):
+    def __init__(self, encoder, decoder, src_decoder, z_encoder, z_decoder):
+        super().__init__(encoder, decoder, src_decoder)
         self.z_encoder = z_encoder
         self.z_decoder = z_decoder
         self.encoder.num_attention_layers = sum(layer is not None for layer in decoder.attention)
@@ -53,20 +54,18 @@ class ZSeqModel(FairseqModel):
     @classmethod
     def build_model(cls, args, src_dict, dst_dict):
         """Build a new model instance."""
-        z_encoder = FConvEncoder(
+        z_encoder = Embedder(
             src_dict,
-            embed_dim=args.encoder_embed_dim,
-            convolutions=[(256, 3)] * 1,
-            dropout=args.dropout,
-            max_positions=args.max_source_positions,
-            use_fc=False
+            embed_dim=256,
+            dropout=args.dropout
         )
 
-        z_decoder = LSTMSampler(
+        z_decoder = Controller(
             encoder_hdim = 256,
             hdim = 256,
-            zdim = 128,
-            num_layers = 1
+            zdim = 256,
+            num_layers = 1,
+            length=1.0
         )
 
         encoder = FConvEncoder(
@@ -88,26 +87,38 @@ class ZSeqModel(FairseqModel):
             max_positions=args.max_target_positions,
             share_embed=args.share_input_output_embed
         )
-        
-        return ZSeqModel(encoder, decoder, z_encoder, z_decoder)
 
-    def forward(self, src_tokens, src_lengths, prev_output_tokens):
+        src_decoder = FConvDecoder(
+            src_dict,
+            embed_dim=args.decoder_embed_dim,
+            convolutions=eval(args.decoder_layers),
+            out_embed_dim=args.decoder_out_embed_dim,
+            attention=eval(args.decoder_attention),
+            dropout=args.dropout,
+            max_positions=args.max_target_positions,
+            share_embed=args.share_input_output_embed
+        )
+        
+        return cls(encoder, decoder, src_decoder, z_encoder, z_decoder)
+
+    def forward(self, src_tokens, src_lengths, prev_src_tokens, prev_output_tokens):
         #src_lengths is actually not used in encoders
-        z_encoder_out,_ = self.z_encoder(src_tokens, src_lengths)
-        z_length = z_encoder_out.size()[1] // 2 + 1
-        z_decoder_out = self.z_decoder(z_encoder_out, z_length)
+        z_encoder_out = self.z_encoder(src_tokens, src_lengths)[0]
+        z_decoder_out = self.z_decoder(z_encoder_out)
 
         encoder_out = self.encoder(z_decoder_out, src_lengths)
         decoder_out, _ = self.decoder(prev_output_tokens, encoder_out)
-        return decoder_out
+        src_decoder_out,_ = self.src_decoder(prev_src_tokens, encoder_out )
 
-class LSTMSampler(nn.Module):
-    """LSTM Z Sampler."""
-    def __init__(self, encoder_hdim=512, hdim=512, zdim=128, num_layers=1, dropout=0):
+        return src_decoder_out, decoder_out
+
+class Controller(nn.Module):
+    def __init__(self, encoder_hdim=512, hdim=512, zdim=128, num_layers=1, dropout=0, window_size=3, length=0.8):
         super().__init__()
         self.hdim = hdim
         self.zdim = zdim
         self.dropout = dropout
+        self.length = length
 
         self.layers = nn.ModuleList([LSTMCell(zdim , hdim)] #input feeding
             + [LSTMCell(hdim, hdim) for layer in range(1, num_layers)]
@@ -115,28 +126,22 @@ class LSTMSampler(nn.Module):
         self.attention = AttentionLayer(encoder_hdim, hdim)
         self.mu_out = Linear(hdim, zdim, dropout=0, bias=False)
         self.sg_out = Linear(hdim, zdim, dropout=0, bias=False)
-        #self.W_feed = Linear(2*hdim, hdim, bias=False)
         self.init_z = nn.Parameter(torch.Tensor(zdim).normal_())
-        self.fc = Linear(self.zdim, encoder_hdim, dropout=0, bias=False)
+        #self.fc = Linear(self.zdim, encoder_hdim, dropout=0, bias=False)
 
-    def forward(self, encoder_hiddens, seqlen):
+    def forward(self, encoder_hiddens):
         num_layers = len(self.layers)
-        bsz = encoder_hiddens.size()[0]
+        bsz,seqlen = encoder_hiddens.size(0),encoder_hiddens.size(1)
+        seqlen = max(int(seqlen * self.length), 1)
 
         zero = Variable(encoder_hiddens.data.new(bsz, self.hdim).zero_())
         prev_hiddens = [zero for i in range(num_layers)]
         prev_cells = [zero for i in range(num_layers)]
 
-        #In the beginning, uniform attention
-        #input_feed = encoder_hiddens.mean(dim=1) 
-        #input_feed = F.tanh(self.W_feed(torch.cat((input_feed, zero), dim=1)))
-
         init_z = torch.stack([self.init_z] * bsz, dim=0)
         zouts = [init_z]
         coverage = Variable(zero.data.new(bsz, encoder_hiddens.size(1)).zero_()).cuda()
         for j in range(seqlen):
-            # input feeding: concatenate context vector from previous time step
-            #input = torch.cat((zouts[-1], input_feed), dim=1)
             input = zouts[-1]
 
             for i, rnn in enumerate(self.layers):
@@ -151,28 +156,22 @@ class LSTMSampler(nn.Module):
                 prev_cells[i] = cell
 
             # apply attention using the last layer's hidden state
-            cxt, attn_score = self.attention(hidden, encoder_hiddens, coverage)
+            cxt, attn_score = self.attention(hidden, encoder_hiddens)
             coverage = coverage + attn_score
-            #out = F.tanh(self.W_feed(torch.cat((cxt, hidden), dim=1)))
-
-            cxt = F.dropout(cxt, p=self.dropout, training=self.training)
-            #out = F.dropout(out, p=self.dropout, training=self.training)
-
-            # input feeding
-            #input_feed = out
 
             # sample z from context vector cxt 
+            cxt = F.dropout(cxt, p=self.dropout, training=self.training)
             mu = self.mu_out(cxt)
             log_sigma = -torch.abs(self.sg_out(cxt))
             if self.training:
-                eps = Variable(mu.data.clone().normal_(std=0.1))
+                eps = Variable(mu.data.clone().normal_(std=0.0001))
             else:
                 eps = 0
             zouts.append( mu + eps * torch.exp(log_sigma / 2) )
 
         # collect outputs across time steps
         zouts = torch.cat(zouts[1:], dim=0).view(seqlen, bsz, self.zdim)
-        zouts = self.fc(zouts)
+        #zouts = self.fc(zouts)
         return zouts.transpose(1, 0) # T x B x C -> B x T x C
 
 class AttentionLayer(nn.Module):
@@ -181,7 +180,7 @@ class AttentionLayer(nn.Module):
         super().__init__()
         self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
 
-    def forward(self, input, source_hids, coverage):
+    def forward(self, input, source_hids):
         # input: bsz x input_embed_dim
         # source_hids: bsz x srclen x output_embed_dim
         # x: bsz x output_embed_dim
@@ -189,9 +188,7 @@ class AttentionLayer(nn.Module):
         
         # compute attention
         attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
-        attn_scores = attn_scores + torch.log(1 - coverage + 1e-6)
         attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-        attn_scores = attn_scores * (1 - coverage)
         #xx,yy = attn_scores.max(dim=1)
         #print(xx[0].item(), yy[0].item())
 
@@ -199,42 +196,30 @@ class AttentionLayer(nn.Module):
         x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
         return x, attn_scores
 
-class LocalAttentionLayer(nn.Module):
-    """T. Luong's local-p attention"""
-    def __init__(self, input_embed_dim, output_embed_dim):
+class Embedder(nn.Module):
+    def __init__(self, dictionary, embed_dim, dropout=0.1, max_positions=1024):
         super().__init__()
+        self.dictionary = dictionary
+        self.embed_dim = embed_dim
+        self.dropout = dropout
 
-        self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
-        self.pos_pred = nn.Sequential(
-                Linear(input_embed_dim, input_embed_dim), 
-                nn.Tanh(), 
-                Linear(input_embed_dim, 1),
-                nn.Sigmoid()
+        num_embeddings = len(dictionary)
+        padding_idx = dictionary.pad()
+        self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+
+        self.embed_positions = PositionalEmbedding(
+            max_positions,
+            embed_dim,
+            padding_idx,
+            left_pad=LanguagePairDataset.LEFT_PAD_SOURCE,
         )
 
-    def forward(self, input, source_hids):
-        # input: bsz x input_embed_dim
-        # source_hids: bsz x srclen x output_embed_dim
+    def forward(self, src_tokens, src_lengths):
+        x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return x, x
 
-        # x: bsz x output_embed_dim
-        x = self.input_proj(input)
-
-        # compute attention
-        attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
-        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-
-        srclen = source_hids.size(1)
-        mean_pos = self.pos_pred(input) * srclen #bsz * 1
-        all_pos = Variable(torch.Tensor(range(srclen))).cuda()
-        dist = all_pos.unsqueeze(0) - mean_pos
         
-        gauss_mask = torch.exp( -dist * dist / 2 ) #bsz * srclen
-        attn_scores = attn_scores * gauss_mask 
-
-        # sum weighted sources
-        x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
-        return x
-
 def LSTM(input_size, hidden_size, **kwargs):
     m = nn.LSTM(input_size, hidden_size, **kwargs)
     for name, param in m.named_parameters():
@@ -252,12 +237,13 @@ def LSTMCell(input_size, hidden_size, **kwargs):
 def Linear(in_features, out_features, dropout=0, bias=True):
     """Weight-normalized Linear layer (input: N x T x C)"""
     m = nn.Linear(in_features, out_features, bias=bias)
+    #m.weight.data.normal_(mean=0, std=math.sqrt(2 * (1 - dropout) / in_features))
     m.weight.data.normal_(mean=0, std=0.1)
     if bias:
         m.bias.data.zero_()
     return m
 
-@register_model_architecture('zseq', 'zseq')
+@register_model_architecture('uni_zword', 'uni_zword')
 def base_architecture(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(512, 3)] * 20')
@@ -268,11 +254,11 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
 
 
-@register_model_architecture('zseq', 'zseq_iwslt_de_en')
+@register_model_architecture('uni_zword', 'uni_zword_iwslt_de_en')
 def fconv_iwslt_de_en(args):
     base_architecture(args)
     args.encoder_embed_dim = 256
-    args.encoder_layers = '[(256, 3)] * 3'
+    args.encoder_layers = '[(256, 3)] * 4'
     args.decoder_embed_dim = 256
     args.decoder_layers = '[(256, 3)] * 3'
     args.decoder_out_embed_dim = 256

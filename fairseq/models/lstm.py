@@ -74,8 +74,7 @@ class LSTMModel(FairseqModel):
 
 class LSTMEncoder(FairseqEncoder):
     """LSTM encoder."""
-    def __init__(self, dictionary, embed_dim=512, num_layers=1, dropout_in=0.1,
-                 dropout_out=0.1):
+    def __init__(self, dictionary, embed_dim=512, num_layers=1, dropout_in=0.1, dropout_out=0.1):
         super().__init__(dictionary)
         self.num_layers = num_layers
         self.dropout_in = dropout_in
@@ -90,7 +89,7 @@ class LSTMEncoder(FairseqEncoder):
             hidden_size=embed_dim,
             num_layers=num_layers,
             dropout=self.dropout_out,
-            bidirectional=False,
+            bidirectional=True,
         )
 
     def forward(self, src_tokens, src_lengths):
@@ -117,8 +116,8 @@ class LSTMEncoder(FairseqEncoder):
         packed_x = nn.utils.rnn.pack_padded_sequence(x, src_lengths.data.tolist())
 
         # apply LSTM
-        h0 = Variable(x.data.new(self.num_layers, bsz, embed_dim).zero_())
-        c0 = Variable(x.data.new(self.num_layers, bsz, embed_dim).zero_())
+        h0 = Variable(x.data.new(2 * self.num_layers, bsz, embed_dim).zero_())
+        c0 = Variable(x.data.new(2 * self.num_layers, bsz, embed_dim).zero_())
         packed_outs, (final_hiddens, final_cells) = self.lstm(
             packed_x,
             (h0, c0),
@@ -127,9 +126,9 @@ class LSTMEncoder(FairseqEncoder):
         # unpack outputs and apply dropout
         x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=0.)
         x = F.dropout(x, p=self.dropout_out, training=self.training)
-        assert list(x.size()) == [seqlen, bsz, embed_dim]
+        #assert list(x.size()) == [seqlen, bsz, embed_dim]
 
-        return x, final_hiddens, final_cells
+        return x.transpose(1, 0), final_hiddens, final_cells
 
     def max_positions(self):
         """Maximum input length supported by the encoder."""

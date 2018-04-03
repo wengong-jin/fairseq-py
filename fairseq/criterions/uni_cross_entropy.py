@@ -13,8 +13,8 @@ from torch.autograd import Variable
 from . import FairseqCriterion, register_criterion
 from fairseq import utils
 
-@register_criterion('multilang_cross_entropy')
-class MLCrossEntropyCriterion(FairseqCriterion):
+@register_criterion('uni_cross_entropy')
+class UniCrossEntropyCriterion(FairseqCriterion):
 
     def __init__(self, args, src_dict, dst_dict):
         super().__init__(args, src_dict, dst_dict)

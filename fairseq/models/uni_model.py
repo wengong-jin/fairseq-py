@@ -10,12 +10,11 @@ import torch.nn as nn
 from . import FairseqModel, FairseqDecoder, FairseqEncoder
 
 
-class MultiLangModel(FairseqModel):
+class UniSeqModel(FairseqModel):
     """Base class for multi lingual encoder-decoder models."""
 
     def __init__(self, encoder, decoder, src_decoder):
         super().__init__(encoder, decoder)
-
         self.src_decoder = src_decoder
         
     def forward(self, src_tokens, src_lengths, prev_src_tokens, prev_output_tokens):

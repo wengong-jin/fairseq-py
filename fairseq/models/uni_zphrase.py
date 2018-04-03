@@ -17,11 +17,11 @@ from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding
 
 from . import FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
 from .fconv import FConvEncoder, FConvDecoder
-from .multilang_model import MultiLangModel
+from .uni_model import UniSeqModel
 
 
-@register_model('mlzseq')
-class MLZSeqModel(MultiLangModel):
+@register_model('uni_zphrase')
+class UniZPhraseModel(UniSeqModel):
     def __init__(self, encoder, decoder, src_decoder, z_encoder, z_decoder):
         super().__init__(encoder, decoder, src_decoder)
         self.z_encoder = z_encoder
@@ -63,11 +63,12 @@ class MLZSeqModel(MultiLangModel):
             use_fc=False
         )
 
-        z_decoder = LSTMSampler(
+        z_decoder = LSTMController(
             encoder_hdim = 256,
             hdim = 256,
             zdim = 256,
-            num_layers = 1
+            num_layers = 1,
+            length = 0.8
         )
 
         encoder = FConvEncoder(
@@ -106,52 +107,46 @@ class MLZSeqModel(MultiLangModel):
     def forward(self, src_tokens, src_lengths, prev_src_tokens, prev_output_tokens):
         #src_lengths is actually not used in encoders
         z_encoder_out,_ = self.z_encoder(src_tokens, src_lengths)
-        z_length = z_encoder_out.size()[1] // 2 + 1
-        z_decoder_out = self.z_decoder(z_encoder_out, z_length)
+        z_decoder_out = self.z_decoder(z_encoder_out)
 
         encoder_out = self.encoder(z_decoder_out, src_lengths)
         decoder_out, _ = self.decoder(prev_output_tokens, encoder_out)
-        src_decoder_out,_ = self.src_decoder(prev_src_tokens, (z_decoder_out,z_decoder_out) )
-        #src_decoder_out,_ = self.src_decoder(prev_src_tokens, encoder_out )
+        src_decoder_out,_ = self.src_decoder(prev_src_tokens, encoder_out )
 
         return src_decoder_out, decoder_out
 
-class LSTMSampler(nn.Module):
-    """LSTM Z Sampler."""
-    def __init__(self, encoder_hdim=512, hdim=512, zdim=128, num_layers=1, dropout=0):
+class Controller(nn.Module):
+    """LSTM Controller."""
+    def __init__(self, encoder_hdim=512, hdim=512, zdim=128, num_layers=1, dropout=0, window_size=3, length=0.8):
         super().__init__()
         self.hdim = hdim
         self.zdim = zdim
         self.dropout = dropout
+        self.length = length
 
         self.layers = nn.ModuleList([LSTMCell(zdim , hdim)] #input feeding
             + [LSTMCell(hdim, hdim) for layer in range(1, num_layers)]
         )
         self.attention = AttentionLayer(encoder_hdim, hdim)
+        #self.attention = LocalAttentionLayer(encoder_hdim, hdim, window_size)
         self.mu_out = Linear(hdim, zdim, dropout=0, bias=False)
         self.sg_out = Linear(hdim, zdim, dropout=0, bias=False)
-        #self.W_feed = Linear(2*hdim, hdim, bias=False)
         self.init_z = nn.Parameter(torch.Tensor(zdim).normal_())
         #self.fc = Linear(self.zdim, encoder_hdim, dropout=0, bias=False)
 
-    def forward(self, encoder_hiddens, seqlen):
+    def forward(self, encoder_hiddens):
         num_layers = len(self.layers)
-        bsz = encoder_hiddens.size()[0]
+        bsz,seqlen = encoder_hiddens.size(0),encoder_hiddens.size(1)
+        seqlen = int(seqlen * self.length) + 1
 
         zero = Variable(encoder_hiddens.data.new(bsz, self.hdim).zero_())
         prev_hiddens = [zero for i in range(num_layers)]
         prev_cells = [zero for i in range(num_layers)]
 
-        #In the beginning, uniform attention
-        #input_feed = encoder_hiddens.mean(dim=1) 
-        #input_feed = F.tanh(self.W_feed(torch.cat((input_feed, zero), dim=1)))
-
         init_z = torch.stack([self.init_z] * bsz, dim=0)
         zouts = [init_z]
         coverage = Variable(zero.data.new(bsz, encoder_hiddens.size(1)).zero_()).cuda()
         for j in range(seqlen):
-            # input feeding: concatenate context vector from previous time step
-            #input = torch.cat((zouts[-1], input_feed), dim=1)
             input = zouts[-1]
 
             for i, rnn in enumerate(self.layers):
@@ -167,20 +162,15 @@ class LSTMSampler(nn.Module):
 
             # apply attention using the last layer's hidden state
             cxt, attn_score = self.attention(hidden, encoder_hiddens, coverage)
+            #cxt, attn_score = self.attention(hidden, encoder_hiddens, coverage, j*self.cratio)
             coverage = coverage + attn_score
-            #out = F.tanh(self.W_feed(torch.cat((cxt, hidden), dim=1)))
-
-            cxt = F.dropout(cxt, p=self.dropout, training=self.training)
-            #out = F.dropout(out, p=self.dropout, training=self.training)
-
-            # input feeding
-            #input_feed = out
 
             # sample z from context vector cxt 
+            cxt = F.dropout(cxt, p=self.dropout, training=self.training)
             mu = self.mu_out(cxt)
             log_sigma = -torch.abs(self.sg_out(cxt))
             if self.training:
-                eps = Variable(mu.data.clone().normal_(std=0.1))
+                eps = Variable(mu.data.clone().normal_(std=0.0001))
             else:
                 eps = 0
             zouts.append( mu + eps * torch.exp(log_sigma / 2) )
@@ -190,8 +180,111 @@ class LSTMSampler(nn.Module):
         #zouts = self.fc(zouts)
         return zouts.transpose(1, 0) # T x B x C -> B x T x C
 
+class PhCNNEncoder(nn.Module):
+    def __init__(self, dictionary, embed_dim, dropout=0.1, max_positions=1024):
+        super().__init__()
+        self.dictionary = dictionary
+        self.embed_dim = embed_dim
+        self.dropout = dropout
+
+        num_embeddings = len(dictionary)
+        self.padding_idx = dictionary.pad()
+        self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
+        self.l_gate = Linear(embed_dim, 1)
+        self.r_gate = Linear(embed_dim, 1)
+        self.W_conv = Linear(3 * embed_dim, embed_dim)
+
+        self.embed_positions = PositionalEmbedding(
+            max_positions,
+            embed_dim,
+            self.padding_idx,
+            left_pad=LanguagePairDataset.LEFT_PAD_SOURCE,
+        )
+        
+        self.lstm = LSTM(
+            input_size=embed_dim,
+            hidden_size=embed_dim,
+            num_layers=1,
+            dropout=0,
+            bidirectional=True
+        )
+
+    def lstm_forward(self, src_tokens, src_lengths):
+        if LanguagePairDataset.LEFT_PAD_SOURCE:
+            # convert left-padding to right-padding
+            src_tokens = utils.convert_padding_direction(
+                src_tokens,
+                src_lengths,
+                self.padding_idx,
+                left_to_right=True,
+            )
+
+        bsz, seqlen = src_tokens.size()
+
+        # embed tokens
+        x = self.embed_tokens(src_tokens)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        embed_dim = x.size(2)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        # pack embedded source tokens into a PackedSequence
+        packed_x = nn.utils.rnn.pack_padded_sequence(x, src_lengths.data.tolist())
+
+        # apply LSTM
+        packed_outs, (final_hiddens, final_cells) = self.lstm(packed_x)
+
+        # unpack outputs and apply dropout
+        x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=0.)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = x.transpose(0, 1)
+
+        return torch.split(x, embed_dim, dim=2)
+
+    def forward(self, src_tokens, src_lengths):
+        f_hids, b_hids = self.lstm_forward(src_tokens, src_lengths)
+        l_gate = F.sigmoid(self.l_gate(f_hids))
+        r_gate = F.sigmoid(self.r_gate(b_hids))
+        print(torch.cat((l_gate,r_gate), dim=2)[0].data)
+
+        x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        pad_x = F.pad(x, (0, 0, 1, 1))
+        lx, rx = pad_x[:,:-2,:], pad_x[:,2:,:]
+        lx = l_gate * lx
+        rx = r_gate * rx
+        x = torch.cat([lx,x,rx], dim=2)
+
+        l_gate,r_gate = l_gate.squeeze(2), r_gate.squeeze(2)
+        ll_gate = F.pad(l_gate[:,:-1], (1, 0))
+        rr_gate = F.pad(r_gate[:,1:], (0, 1))
+
+        return F.relu(self.W_conv(x)), (1 - ll_gate) * (1 - rr_gate)
+
 class AttentionLayer(nn.Module):
     """T. Luong's global attention"""
+    def __init__(self, input_embed_dim, output_embed_dim):
+        super().__init__()
+        self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
+
+    def forward(self, input, source_hids):
+        # input: bsz x input_embed_dim
+        # source_hids: bsz x srclen x output_embed_dim
+        # x: bsz x output_embed_dim
+        x = self.input_proj(input)
+        
+        # compute attention
+        attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
+        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
+        #xx,yy = attn_scores.max(dim=1)
+        #print(xx[0].item(), yy[0].item())
+
+        # sum weighted sources
+        x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
+        return x, attn_scores
+
+class MaxPoolAttentionLayer(nn.Module):
     def __init__(self, input_embed_dim, output_embed_dim):
         super().__init__()
         self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
@@ -205,50 +298,49 @@ class AttentionLayer(nn.Module):
         # compute attention
         attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
         attn_scores = attn_scores + torch.log(1 - coverage + 1e-6)
-        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-        attn_scores = attn_scores * (1 - coverage)
-        #xx,yy = attn_scores.max(dim=1)
-        #print(xx[0].item(), yy[0].item())
+        attn_scores = F.softmax(attn_scores) * (1 - coverage)
+        score,idx = F.adaptive_max_pool1d(attn_scores.unsqueeze(1), 1, return_indices=True)
+        #print(score[0][0].item(), idx[0][0].item())
 
-        # sum weighted sources
-        x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
-        return x, attn_scores
+        seqlen = source_hids.size(1)
+        attn_scores = F.max_unpool1d(score, idx, kernel_size=seqlen, stride=seqlen)
+        x = (source_hids * attn_scores.transpose(1,2)).sum(dim=1)
+
+        return x, attn_scores.squeeze(1)
 
 class LocalAttentionLayer(nn.Module):
-    """T. Luong's local-p attention"""
-    def __init__(self, input_embed_dim, output_embed_dim):
+    """T. Luong's local attention"""
+    def __init__(self, input_embed_dim, output_embed_dim, window_size):
         super().__init__()
-
         self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
-        self.pos_pred = nn.Sequential(
-                Linear(input_embed_dim, input_embed_dim), 
-                nn.Tanh(), 
-                Linear(input_embed_dim, 1),
-                nn.Sigmoid()
-        )
+        self.window_size = window_size
 
-    def forward(self, input, source_hids):
+    def forward(self, input, source_hids, coverage, pos):
         # input: bsz x input_embed_dim
         # source_hids: bsz x srclen x output_embed_dim
-
         # x: bsz x output_embed_dim
         x = self.input_proj(input)
-
-        # compute attention
-        attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
-        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-
-        srclen = source_hids.size(1)
-        mean_pos = self.pos_pred(input) * srclen #bsz * 1
-        all_pos = Variable(torch.Tensor(range(srclen))).cuda()
-        dist = all_pos.unsqueeze(0) - mean_pos
         
-        gauss_mask = torch.exp( -dist * dist / 2 ) #bsz * srclen
-        attn_scores = attn_scores * gauss_mask 
+        # compute attention
+        bsz,seqlen = source_hids.size(0),source_hids.size(1)
+        l,r = max(0, pos-self.window_size), min(seqlen, pos+self.window_size+1)
+        source_hids = source_hids[:, l:r, :]
+        coverage = coverage[:, l:r]
+        attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
+        attn_scores = attn_scores + torch.log(1 - coverage + 1e-6)
+        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
+        attn_scores = attn_scores * (1 - coverage)
 
         # sum weighted sources
         x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
-        return x
+        if l > 0:
+            zero = Variable(coverage.data.new(bsz,l).zero_())
+            attn_scores = torch.cat((zero,attn_scores), dim=1)
+        if r < seqlen:
+            zero = Variable(coverage.data.new(bsz,seqlen-r).zero_())
+            attn_scores = torch.cat((attn_scores,zero), dim=1)
+
+        return x, attn_scores
 
 def LSTM(input_size, hidden_size, **kwargs):
     m = nn.LSTM(input_size, hidden_size, **kwargs)
@@ -272,7 +364,7 @@ def Linear(in_features, out_features, dropout=0, bias=True):
         m.bias.data.zero_()
     return m
 
-@register_model_architecture('mlzseq', 'mlzseq')
+@register_model_architecture('uni_zphrase', 'uni_zphrase')
 def base_architecture(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(512, 3)] * 20')
@@ -283,11 +375,11 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
 
 
-@register_model_architecture('mlzseq', 'mlzseq_iwslt_de_en')
+@register_model_architecture('uni_zphrase', 'uni_zphrase_iwslt_de_en')
 def fconv_iwslt_de_en(args):
     base_architecture(args)
     args.encoder_embed_dim = 256
-    args.encoder_layers = '[(256, 3)] * 3'
+    args.encoder_layers = '[(256, 3)] * 4'
     args.decoder_embed_dim = 256
     args.decoder_layers = '[(256, 3)] * 3'
     args.decoder_out_embed_dim = 256

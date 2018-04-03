@@ -15,12 +15,12 @@ from fairseq.data import LanguagePairDataset
 from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding, LinearizedConvolution
 
 from . import register_model, register_model_architecture
-from .multilang_model import MultiLangModel
+from .uni_model import UniSeqModel
 from .fconv import FConvEncoder, FConvDecoder
 
 
-@register_model('mlfconv')
-class MLFConvModel(MultiLangModel):
+@register_model('unifconv')
+class UniFConvModel(UniSeqModel):
     def __init__(self, encoder, decoder, src_decoder):
         super().__init__(encoder, decoder, src_decoder)
         self.encoder.num_attention_layers = sum(layer is not None for layer in decoder.attention)
@@ -80,7 +80,7 @@ class MLFConvModel(MultiLangModel):
         return MLFConvModel(encoder, decoder, src_decoder)
 
 
-@register_model_architecture('mlfconv', 'mlfconv')
+@register_model_architecture('unifconv', 'unifconv')
 def base_architecture(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(512, 3)] * 20')
@@ -91,7 +91,7 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
 
 
-@register_model_architecture('mlfconv', 'mlfconv_iwslt_de_en')
+@register_model_architecture('unifconv', 'unifconv_iwslt_de_en')
 def fconv_iwslt_de_en(args):
     base_architecture(args)
     args.encoder_embed_dim = 256
@@ -101,7 +101,7 @@ def fconv_iwslt_de_en(args):
     args.decoder_out_embed_dim = 256
 
 
-@register_model_architecture('mlfconv', 'mlfconv_wmt_en_ro')
+@register_model_architecture('unifconv', 'unifconv_wmt_en_ro')
 def fconv_wmt_en_ro(args):
     base_architecture(args)
     args.encoder_embed_dim = 512
@@ -111,7 +111,7 @@ def fconv_wmt_en_ro(args):
     args.decoder_out_embed_dim = 512
 
 
-@register_model_architecture('mlfconv', 'mlfconv_wmt_en_de')
+@register_model_architecture('unifconv', 'unifconv_wmt_en_de')
 def fconv_wmt_en_de(args):
     base_architecture(args)
     convs = '[(512, 3)] * 9'       # first 9 layers have 512 units
@@ -124,7 +124,7 @@ def fconv_wmt_en_de(args):
     args.decoder_out_embed_dim = 512
 
 
-@register_model_architecture('mlfconv', 'mlfconv_wmt_en_fr')
+@register_model_architecture('unifconv', 'unifconv_wmt_en_fr')
 def fconv_wmt_en_fr(args):
     base_architecture(args)
     convs = '[(512, 3)] * 6'       # first 6 layers have 512 units
