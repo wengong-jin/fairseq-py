@@ -120,7 +120,6 @@ class SequenceGenerator(object):
             z_encoder_out,_ = model.z_encoder(btokens, blen)
             z_decoder_out = model.z_decoder(z_encoder_out)
             encoder_out = model.encoder(z_decoder_out, blen)
-            #"""
 
             encoder_outs.append(encoder_out)
 

@@ -15,17 +15,25 @@ from fairseq import utils
 from fairseq.data import LanguagePairDataset
 from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding, LinearizedConvolution
 
-from . import FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
-from .fconv import Embedding, PositionalEmbedding, FConvEncoder, FConvDecoder
+from . import FairseqEncoder, FairseqDecoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
+from .fconv import Embedding, PositionalEmbedding, LinearizedConv1d, FConvEncoder, FConvDecoder
 
 
-@register_model('uni_zword')
-class ZWordModel(FairseqModel):
-    def __init__(self, decoder, z_encoder, z_decoder):
-        super().__init__(z_encoder, decoder)
-        self.z_encoder = z_encoder
-        self.z_decoder = z_decoder
-        self.z_encoder.num_attention_layers = 1
+@register_model('fast_align')
+class FastAlignModel(FairseqModel):
+    def __init__(self, src_embedding, src_controller, src_decoder, tgt_embedding, tgt_controller, tgt_decoder, all_encoder):
+        super().__init__(src_embedding, tgt_decoder) #For compatibility
+        self.src_embedding = src_embedding
+        self.src_controller = src_controller
+        self.src_decoder = src_decoder
+        self.tgt_embedding = tgt_embedding
+        self.tgt_controller = tgt_controller
+        self.tgt_decoder = tgt_decoder
+        self.all_encoder = all_encoder
+
+        #tgt_decoder and src_decoder must have the same depth
+        self.all_encoder.num_attention_layers = sum(layer is not None for layer in tgt_decoder.attention)
+        self.Ireg = False
 
     @staticmethod
     def add_args(parser):
@@ -50,23 +58,22 @@ class ZWordModel(FairseqModel):
                                  ' to be equal)')
 
     @classmethod
-    def build_model(cls, args, src_dict, dst_dict):
+    def build_model(cls, args, src_dict, tgt_dict):
         """Build a new model instance."""
-        z_encoder = Embedder(
+        src_embedding = Embedder(src_dict, embed_dim=args.encoder_embed_dim)
+        tgt_embedding = Embedder(tgt_dict, embed_dim=args.encoder_embed_dim)
+        
+        all_encoder = FConvEncoder(
+            src_dict, #Just a dummy
+            embed_dim=args.encoder_embed_dim,
+            convolutions=eval(args.encoder_layers),
+            dropout=args.dropout,
+            max_positions=args.max_source_positions,
+            embed=False
+        )
+
+        src_decoder = FConvDecoder(
             src_dict,
-            embed_dim=256,
-            dropout=args.dropout
-        )
-
-        z_decoder = Controller(
-            encoder_hdim = 256,
-            hdim = 256,
-            zdim = 256,
-            num_layers = 1,
-        )
-
-        decoder = FConvDecoder(
-            dst_dict,
             embed_dim=args.decoder_embed_dim,
             convolutions=eval(args.decoder_layers),
             out_embed_dim=args.decoder_out_embed_dim,
@@ -76,92 +83,53 @@ class ZWordModel(FairseqModel):
             share_embed=args.share_input_output_embed
         )
 
-        return cls(decoder, z_encoder, z_decoder)
-
-    def forward(self, src_tokens, src_lengths, prev_output_tokens):
-        #src_lengths is actually not used in encoders
-        z_length = src_tokens.size(1)
-        z_encoder_out = self.z_encoder(src_tokens, src_lengths)[0]
-        z_decoder_out = self.z_decoder(z_encoder_out, z_length)
-
-        encoder_out = (z_decoder_out, z_decoder_out)
-        decoder_out, _ = self.decoder(prev_output_tokens, encoder_out)
-
-        return decoder_out
-
-class Controller(nn.Module):
-    def __init__(self, encoder_hdim=512, hdim=512, zdim=128, num_layers=1, dropout=0):
-        super().__init__()
-        self.hdim = hdim
-        self.zdim = zdim
-        self.dropout = dropout
-
-        self.layers = nn.ModuleList([LSTMCell(zdim , hdim)] #input feeding
-            + [LSTMCell(hdim, hdim) for layer in range(1, num_layers)]
+        tgt_decoder = FConvDecoder(
+            tgt_dict,
+            embed_dim=args.decoder_embed_dim,
+            convolutions=eval(args.decoder_layers),
+            out_embed_dim=args.decoder_out_embed_dim,
+            attention=eval(args.decoder_attention),
+            dropout=args.dropout,
+            max_positions=args.max_target_positions,
+            share_embed=args.share_input_output_embed
         )
-        self.attention = AttentionLayer(encoder_hdim, hdim)
-        self.mu_out = Linear(hdim, zdim, dropout=0, bias=False)
-        #self.sg_out = Linear(hdim, zdim, dropout=0, bias=False)
-        self.init_z = nn.Parameter(torch.Tensor(zdim).normal_(0, 0.1))
-        #self.fc = Linear(self.zdim, encoder_hdim, dropout=0, bias=False)
 
-    def forward(self, encoder_hiddens, seqlen):
-        num_layers = len(self.layers)
-        bsz,seqlen = encoder_hiddens.size(0),encoder_hiddens.size(1)
+        return cls(src_embedding, src_controller, src_decoder, tgt_embedding, tgt_controller, tgt_decoder, all_encoder)
 
-        zero = Variable(encoder_hiddens.data.new(bsz, self.hdim).zero_())
-        prev_hiddens = [zero for i in range(num_layers)]
-        prev_cells = [zero for i in range(num_layers)]
+    def forward(self, src_tokens, tgt_tokens, src_lengths, prev_src_tokens, prev_output_tokens):
+        #src_lengths is actually not used 
+        bsz = src_tokens.size(0)
+        src_x = self.src_embedding(src_tokens, src_lengths)
+        tgt_x = self.tgt_embedding(tgt_tokens, src_lengths)
 
-        init_z = torch.stack([self.init_z] * bsz, dim=0)
-        zouts = [init_z]
-        for j in range(seqlen):
-            input = zouts[-1]
-
-            for i, rnn in enumerate(self.layers):
-                # recurrent cell
-                hidden, cell = rnn(input, (prev_hiddens[i], prev_cells[i]))
-
-                # hidden state becomes the input to the next layer
-                input = F.dropout(hidden, p=self.dropout, training=self.training)
-
-                # save state for next time step
-                prev_hiddens[i] = hidden
-                prev_cells[i] = cell
-
-            # apply attention using the last layer's hidden state
-            cxt, attn_score = self.attention(hidden, encoder_hiddens)
-
-            # sample z from context vector cxt 
-            cxt = F.dropout(cxt, p=self.dropout, training=self.training)
-            mu = self.mu_out(cxt)
-            zouts.append( mu )
-
-        # collect outputs across time steps
-        #zouts = self.fc(zouts)
-        return torch.stack(zouts[1:], dim=1) 
-
-class AttentionLayer(nn.Module):
-    """T. Luong's global attention"""
-    def __init__(self, input_embed_dim, output_embed_dim):
-        super().__init__()
-        self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
-
-    def forward(self, input, source_hids):
-        # input: bsz x input_embed_dim
-        # source_hids: bsz x srclen x output_embed_dim
-        # x: bsz x output_embed_dim
-        x = self.input_proj(input)
         
-        # compute attention
-        attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
-        attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-        #xx,yy = attn_scores.max(dim=1)
-        #print(xx[0].item(), yy[0].item())
+        src_encoder_out = self.all_encoder(src_x, src_lengths)
+        tgt_encoder_out = self.all_encoder(tgt_x, src_lengths)
 
-        # sum weighted sources
-        x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
-        return x, attn_scores
+        tgt_decoder_out,attn_cb = self.tgt_decoder(prev_output_tokens, src_encoder_out)
+        src_decoder_out,attn_ca = self.src_decoder(prev_src_tokens, tgt_encoder_out)
+
+        reg = F.mse_loss(src_x, tgt_x) * bsz #size_average takes mean over all dimensions
+        #print("%.6f" % (reg.data.item() / bsz))
+
+        if self.Ireg and self.training:
+            attn_aa = torch.bmm(attn_ca, attn_ac)
+            attn_bb = torch.bmm(attn_cb, attn_bc)
+            I_a = Variable(torch.eye(src_tokens.size(1))).cuda()
+            I_b = Variable(torch.eye(tgt_tokens.size(1))).cuda()
+            I_a = torch.stack([I_a] * bsz, dim=0)
+            I_b = torch.stack([I_b] * bsz, dim=0)
+            Ireg = F.mse_loss(attn_aa, I_a) + F.mse_loss(attn_bb, I_b)
+            reg += Ireg * bsz
+        
+        attn_aa = torch.bmm(attn_ca, attn_ac)
+        attn_bb = torch.bmm(attn_cb, attn_bc)
+        xx,yy = attn_ac[0].max(dim=1)
+        xx1,yy1 = attn_bc[0].max(dim=1)
+        #print(torch.stack([xx,yy.float(),xx1,yy1.float()],dim=1))
+        print(attn_aa[0])
+
+        return src_decoder_out, tgt_decoder_out, reg
 
 class Embedder(FairseqEncoder):
     def __init__(self, dictionary, embed_dim, dropout=0.1, max_positions=1024):
@@ -177,7 +145,7 @@ class Embedder(FairseqEncoder):
     def forward(self, src_tokens, src_lengths):
         x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
         x = F.dropout(x, p=self.dropout, training=self.training)
-        return x, x
+        return x
 
     def max_positions(self):
         """Maximum input length supported by the encoder."""
@@ -201,13 +169,12 @@ def LSTMCell(input_size, hidden_size, **kwargs):
 def Linear(in_features, out_features, dropout=0, bias=True):
     """Weight-normalized Linear layer (input: N x T x C)"""
     m = nn.Linear(in_features, out_features, bias=bias)
-    #m.weight.data.normal_(mean=0, std=math.sqrt(2 * (1 - dropout) / in_features))
     m.weight.data.normal_(mean=0, std=0.1)
     if bias:
         m.bias.data.zero_()
     return m
 
-@register_model_architecture('uni_zword', 'uni_zword')
+@register_model_architecture('fast_align', 'fast_align')
 def base_architecture(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(512, 3)] * 20')
@@ -218,12 +185,12 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
 
 
-@register_model_architecture('uni_zword', 'uni_zword_iwslt_de_en')
-def fconv_iwslt_de_en(args):
+@register_model_architecture('fast_align', 'fast_align_iwslt_de_en')
+def align_iwslt_de_en(args):
     base_architecture(args)
     args.encoder_embed_dim = 256
-    args.encoder_layers = '[(256, 3)] * 1'
+    args.encoder_layers = '[(256, 3)] * 4'
     args.decoder_embed_dim = 256
-    args.decoder_layers = '[(256, 3)] * 2'
+    args.decoder_layers = '[(256, 3)] * 3'
     args.decoder_out_embed_dim = 256
 

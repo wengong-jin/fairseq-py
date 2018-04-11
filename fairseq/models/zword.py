@@ -11,47 +11,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-from sklearn.metrics import f1_score
-
 from fairseq import utils
 from fairseq.data import LanguagePairDataset
 from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding, LinearizedConvolution
 
 from . import FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
-from .fconv import FConvEncoder, FConvDecoder, Embedding, PositionalEmbedding
+from .fconv import Embedding, PositionalEmbedding, FConvEncoder, FConvDecoder
 
 
-@register_model('uni_zphrase')
-class UniZPhraseModel(FairseqModel):
-    def __init__(self, encoder, decoder, z_encoder, z_decoder, align_file):
+@register_model('zword')
+class ZWordModel(FairseqModel):
+    def __init__(self, encoder, decoder, z_encoder, z_decoder):
         super().__init__(encoder, decoder)
         self.z_encoder = z_encoder
         self.z_decoder = z_decoder
         self.encoder.num_attention_layers = sum(layer is not None for layer in decoder.attention)
         self.z_encoder.num_attention_layers = 1
-        self.all_align = []
-
-        with open(align_file) as f:
-            self.align = [line.strip("\r\n ").split() for line in f]
-
-        for idx,align in enumerate(self.align):
-            align = [x.split('-') for x in align]
-            align = [(int(x[0]),int(x[1])) for x in align]
-            srclen = max([x for x,y in align]) + 1
-            amap = [set() for i in range(srclen)]
-            for x,y in align:
-                amap[x].add(y)
-
-            label = torch.zeros(srclen) #there is an extra token </s> at the end
-            for i in range(srclen - 1):
-                #if len(amap[i]) == 0 or len(amap[i + 1]) == 0 or len(amap[i] & amap[i + 1]) > 0:
-                if len(amap[i] & amap[i + 1]) > 0:
-                    label[i] = 1
-
-            self.all_align.append(Variable(label))
-
-        self.train_align = self.all_align[:160215]
-        self.valid_align = self.all_align[160215:]
 
     @staticmethod
     def add_args(parser):
@@ -74,16 +49,14 @@ class UniZPhraseModel(FairseqModel):
                             help='share input and output embeddings (requires'
                                  ' --decoder-out-embed-dim and --decoder-embed-dim'
                                  ' to be equal)')
-        parser.add_argument('--align-file', type=str) 
 
     @classmethod
     def build_model(cls, args, src_dict, dst_dict):
         """Build a new model instance."""
-        z_encoder = SegEncoder(
+        z_encoder = Embedder(
             src_dict,
-            embed_dim=args.encoder_embed_dim,
-            dropout=args.dropout,
-            max_positions=args.max_source_positions
+            embed_dim=256,
+            dropout=args.dropout
         )
 
         z_decoder = Controller(
@@ -91,7 +64,7 @@ class UniZPhraseModel(FairseqModel):
             hdim = 256,
             zdim = 256,
             num_layers = 1,
-            length = 1
+            length=1.0
         )
 
         encoder = FConvEncoder(
@@ -114,18 +87,12 @@ class UniZPhraseModel(FairseqModel):
             share_embed=args.share_input_output_embed
         )
 
-        return cls(encoder, decoder, z_encoder, z_decoder, args.align_file)
+        return cls(encoder, decoder, z_encoder, z_decoder)
 
-    def forward(self, src_tokens, tgt_tokens, src_lengths, prev_src_tokens, prev_output_tokens, sent_ids):
-        if self.training:
-            seg_scores = [self.train_align[i] for i in sent_ids]
-        else:
-            seg_scores = [self.valid_align[i] for i in sent_ids]
-        seg_scores = sorted(seg_scores, key=lambda x:x.size(0), reverse=True)
-        seg_scores = nn.utils.rnn.pad_sequence(seg_scores, batch_first=True).cuda()
-
-        z_encoder_out, seg_scores = self.z_encoder(src_tokens, src_lengths, seg_scores)
-        z_decoder_out = self.z_decoder(z_encoder_out, seg_scores)
+    def forward(self, src_tokens, src_lengths, prev_output_tokens):
+        #src_lengths is actually not used in encoders
+        z_encoder_out = self.z_encoder(src_tokens, src_lengths)[0]
+        z_decoder_out = self.z_decoder(z_encoder_out)
 
         encoder_out = self.encoder(z_decoder_out, src_lengths)
         decoder_out, _ = self.decoder(prev_output_tokens, encoder_out)
@@ -149,7 +116,7 @@ class Controller(nn.Module):
         self.init_z = nn.Parameter(torch.Tensor(zdim).normal_(0, 0.1))
         #self.fc = Linear(self.zdim, encoder_hdim, dropout=0, bias=False)
 
-    def forward(self, encoder_hiddens, seg_scores):
+    def forward(self, encoder_hiddens):
         num_layers = len(self.layers)
         bsz,seqlen = encoder_hiddens.size(0),encoder_hiddens.size(1)
         seqlen = max(int(seqlen * self.length), 1)
@@ -175,7 +142,7 @@ class Controller(nn.Module):
                 prev_cells[i] = cell
 
             # apply attention using the last layer's hidden state
-            cxt, attn_score = self.attention(hidden, encoder_hiddens, seg_scores)
+            cxt, attn_score = self.attention(hidden, encoder_hiddens)
 
             # sample z from context vector cxt 
             cxt = F.dropout(cxt, p=self.dropout, training=self.training)
@@ -192,61 +159,13 @@ class Controller(nn.Module):
         #zouts = self.fc(zouts)
         return zouts.transpose(1, 0) # T x B x C -> B x T x C
 
-class SegEncoder(nn.Module):
-    def __init__(self, dictionary, embed_dim, dropout=0.1, max_positions=1024, max_num_segs=3):
-        super().__init__()
-        self.dictionary = dictionary
-        self.embed_dim = embed_dim
-        self.dropout = dropout
-        self.max_num_segs = max_num_segs
-
-        num_embeddings = len(dictionary)
-        self.padding_idx = dictionary.pad()
-        self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
-        #self.conv1 = Linear(embed_dim, embed_dim)
-        self.conv2 = Conv1d(embed_dim, embed_dim, kernel_size=2)
-
-        self.embed_positions = PositionalEmbedding(
-            max_positions,
-            embed_dim,
-            self.padding_idx,
-            left_pad=LanguagePairDataset.LEFT_PAD_SOURCE,
-        )
-        
-    def forward(self, src_tokens, src_lengths, seg_scores):
-        seg_scores = F.pad(seg_scores, (1, 1))
-        l_seg = seg_scores[:, :-1]
-        r_seg = seg_scores[:, 1:]
-        pscore1 = (1 - l_seg) * (1 - r_seg)
-
-        #2-word phrase
-        l_seg = seg_scores[:, :-2]
-        r_seg = seg_scores[:, 2:]
-        m_seg = seg_scores[:, 1:-1]
-        pscore2 = (1 - l_seg) * (1 - r_seg) * m_seg
-
-        x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        #x1 = F.relu(self.conv1(x))
-        x1 = x * pscore1.unsqueeze(2)
-
-        x2 = F.relu(self.conv2(x.transpose(1, 2))) #no padding
-        x2 = F.dropout(x2, p=self.dropout, training=self.training)
-        x2 = x2.transpose(1, 2)
-        x2 = x2 * pscore2.unsqueeze(2)
-
-        x = torch.cat((x1[:,:-1,:] + x2, x1[:,-1:,:]), dim=1)
-        phrase_scores = torch.cat((pscore1[:,:-1] + pscore2, pscore1[:,-1:]), dim=1)
-
-        return x, phrase_scores
-
 class AttentionLayer(nn.Module):
     """T. Luong's global attention"""
     def __init__(self, input_embed_dim, output_embed_dim):
         super().__init__()
         self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
 
-    def forward(self, input, source_hids, seg_scores):
+    def forward(self, input, source_hids):
         # input: bsz x input_embed_dim
         # source_hids: bsz x srclen x output_embed_dim
         # x: bsz x output_embed_dim
@@ -254,24 +173,69 @@ class AttentionLayer(nn.Module):
         
         # compute attention
         attn_scores = (source_hids * x.unsqueeze(1)).sum(dim=2)
-        attn_scores = attn_scores - 100.0 * (1 - seg_scores)
         attn_scores = F.softmax(attn_scores, dim=1)  # bsz x srclen
-        
-        xx,yy = attn_scores.max(dim=1)
-        xx,yy = xx[0].item(), yy[0].item()
-        #print(xx,yy)
-        """
-        srclen = (source_hids.size(1) + 1) // 2
-        if yy < srclen:
-            print(xx, 0, yy, seg_scores[0,yy].item())
-        else:
-            print(xx, 1, yy - srclen, seg_scores[0,yy].item())
-        """
+        #xx,yy = attn_scores.max(dim=1)
+        #print(xx[0].item(), yy[0].item())
 
         # sum weighted sources
         x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=1)
         return x, attn_scores
 
+class Embedder(nn.Module):
+    def __init__(self, dictionary, embed_dim, dropout=0.1, max_positions=1024, max_word_len=5):
+        super().__init__()
+        self.dictionary = dictionary
+        self.embed_dim = embed_dim
+        self.dropout = dropout
+        self.max_word_len = max_word_len
+
+        num_embeddings = len(dictionary)
+        padding_idx = dictionary.pad()
+        self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+        #self.W_conv = Linear(max_word_len * embed_dim, embed_dim)
+        self.embed_positions = PositionalEmbedding(
+            max_positions,
+            embed_dim,
+            padding_idx,
+            left_pad=LanguagePairDataset.LEFT_PAD_SOURCE
+        )
+
+    def forward(self, src_tokens, src_lengths):
+        x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return x, x
+
+        """
+        tokens = src_tokens.tolist()
+        bsz,srclen = src_tokens.size(0), src_tokens.size(1)
+
+        batch = []
+        for i in range(bsz):
+            sent,word = [],[]
+            for j in range(srclen):
+                word.append(x[i][j])
+                if not self.dictionary.is_bpe(tokens[i][j]) or len(word) == self.max_word_len:
+                    sent.append(word)
+                    word = []
+
+            for k,word in enumerate(sent):
+                pad_len = self.max_word_len - len(word)
+                word = torch.cat(word, dim=0)
+                if pad_len > 0:
+                    word = F.pad(word, (0, pad_len * self.embed_dim))
+                sent[k] = word
+
+            sent = torch.stack(sent, dim=0)
+            batch.append(sent)
+
+        for i,sent in enumerate(batch):
+            pad_len = srclen - sent.size(0)
+            if pad_len > 0:
+                batch[i] = F.pad(sent, (0, 0, 0, pad_len))
+
+        batch = torch.stack(batch, dim=0)
+        x = F.relu(self.W_conv(batch))
+        """
 
 def LSTM(input_size, hidden_size, **kwargs):
     m = nn.LSTM(input_size, hidden_size, **kwargs)
@@ -288,19 +252,15 @@ def LSTMCell(input_size, hidden_size, **kwargs):
     return m
 
 def Linear(in_features, out_features, dropout=0, bias=True):
+    """Weight-normalized Linear layer (input: N x T x C)"""
     m = nn.Linear(in_features, out_features, bias=bias)
+    #m.weight.data.normal_(mean=0, std=math.sqrt(2 * (1 - dropout) / in_features))
     m.weight.data.normal_(mean=0, std=0.1)
     if bias:
         m.bias.data.zero_()
     return m
 
-def Conv1d(in_features, out_features, kernel_size, dropout=0):
-    m = nn.Conv1d(in_features, out_features, kernel_size)
-    m.weight.data.normal_(mean=0, std=0.1)
-    m.bias.data.zero_()
-    return m
-
-@register_model_architecture('uni_zphrase', 'uni_zphrase')
+@register_model_architecture('zword', 'zword')
 def base_architecture(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(512, 3)] * 20')
@@ -311,7 +271,7 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
 
 
-@register_model_architecture('uni_zphrase', 'uni_zphrase_iwslt_de_en')
+@register_model_architecture('zword', 'zword_iwslt_de_en')
 def fconv_iwslt_de_en(args):
     base_architecture(args)
     args.encoder_embed_dim = 256

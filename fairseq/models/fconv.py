@@ -71,7 +71,7 @@ class FConvModel(FairseqModel):
 class FConvEncoder(FairseqEncoder):
     """Convolutional encoder"""
     def __init__(self, dictionary, embed_dim=512, max_positions=1024,
-                 convolutions=((512, 3),) * 20, dropout=0.1, embed=True, use_fc=True):
+                 convolutions=((512, 3),) * 20, dropout=0.1, embed=True, use_fc=True, left_pad=LanguagePairDataset.LEFT_PAD_SOURCE):
         super().__init__(dictionary)
         self.dropout = dropout
         self.num_attention_layers = None
@@ -86,7 +86,7 @@ class FConvEncoder(FairseqEncoder):
             max_positions,
             embed_dim,
             padding_idx,
-            left_pad=LanguagePairDataset.LEFT_PAD_SOURCE,
+            left_pad=left_pad
         )
 
         in_channels = convolutions[0][0]
@@ -201,7 +201,8 @@ class FConvDecoder(FairseqIncrementalDecoder):
     """Convolutional decoder"""
     def __init__(self, dictionary, embed_dim=512, out_embed_dim=256,
                  max_positions=1024, convolutions=((512, 3),) * 20,
-                 attention=True, dropout=0.1, share_embed=False):
+                 attention=True, dropout=0.1, share_embed=False,
+                 left_pad=LanguagePairDataset.LEFT_PAD_TARGET):
         super().__init__(dictionary)
         self.register_buffer('version', torch.Tensor([2]))
         self.dropout = dropout
@@ -221,7 +222,7 @@ class FConvDecoder(FairseqIncrementalDecoder):
             max_positions,
             embed_dim,
             padding_idx,
-            left_pad=LanguagePairDataset.LEFT_PAD_TARGET,
+            left_pad=left_pad
         )
 
         self.fc1 = Linear(embed_dim, in_channels, dropout=dropout)

@@ -11,7 +11,7 @@ import torch
 
 class Dictionary(object):
     """A mapping from symbols to consecutive integers"""
-    def __init__(self, pad='<pad>', eos='</s>', unk='<unk>'):
+    def __init__(self, pad='<pad>', eos='</s>', unk='<unk>', bpe='@@'):
         self.unk_word, self.pad_word, self.eos_word = unk, pad, eos
         self.symbols = []
         self.count = []
@@ -22,6 +22,7 @@ class Dictionary(object):
         self.eos_index = self.add_symbol(eos)
         self.unk_index = self.add_symbol(unk)
         self.nspecial = len(self.symbols)
+        self.bpe = bpe
 
     def __getitem__(self, idx):
         if idx < len(self.symbols):
@@ -31,6 +32,9 @@ class Dictionary(object):
     def __len__(self):
         """Returns the number of symbols in the dictionary"""
         return len(self.symbols)
+
+    def is_bpe(self, idx):
+        return self[idx].endswith(self.bpe)
 
     def index(self, sym):
         """Returns the index of the specified symbol"""

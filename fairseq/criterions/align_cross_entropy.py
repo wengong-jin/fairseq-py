@@ -13,8 +13,8 @@ from torch.autograd import Variable
 from . import FairseqCriterion, register_criterion
 from fairseq import utils
 
-@register_criterion('uni_cross_entropy')
-class UniCrossEntropyCriterion(FairseqCriterion):
+@register_criterion('align_cross_entropy')
+class AlignCrossEntropyCriterion(FairseqCriterion):
 
     def __init__(self, args, src_dict, dst_dict):
         super().__init__(args, src_dict, dst_dict)
@@ -32,23 +32,16 @@ class UniCrossEntropyCriterion(FairseqCriterion):
         start = Variable(src_tokens.data[:,0:1].clone().fill_(self.eos_idx))
         net_input['prev_src_tokens'] = torch.cat((start, src_tokens[:,:-1]), dim=1)
         net_input['tgt_tokens'] = Variable(sample['target'].data.clone())
-        src_output,tgt_output,reg_loss = model(**net_input)
+        net_input['sent_ids'] = sample['id']
+        tgt_output = model(**net_input)
 
         lprobs = model.get_normalized_probs(tgt_output, log_probs=True)
         lprobs = lprobs.view(-1, lprobs.size(-1))
         target = sample['target'].view(-1)
-        tgt_loss = F.nll_loss(lprobs, target, size_average=False, ignore_index=self.padding_idx, reduce=reduce)
+        loss = F.nll_loss(lprobs, target, size_average=False, ignore_index=self.padding_idx, reduce=reduce)
 
-        lprobs = model.get_normalized_probs(src_output, log_probs=True)
-        lprobs = lprobs.view(-1, lprobs.size(-1))
-        target = src_tokens.view(-1)
-        src_loss = F.nll_loss(lprobs, target, size_average=False, ignore_index=self.padding_idx, reduce=reduce)
-
-        loss = 0.5 * src_loss + 0.5 * tgt_loss + reg_loss
-        
         sample_size = sample['target'].size(0) if self.args.sentence_avg else sample['ntokens'] 
         logging_output = {
-            #'loss': utils.item(src_loss.data) if reduce else src_loss.data,
             'loss': utils.item(tgt_loss.data) if reduce else tgt_loss.data,
             'ntokens': sample['ntokens'],
             'sample_size': sample_size,
