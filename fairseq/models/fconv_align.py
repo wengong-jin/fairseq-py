@@ -15,18 +15,19 @@ from fairseq import utils
 from fairseq.data import LanguagePairDataset
 from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding, LinearizedConvolution
 
-from . import FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
-from .fconv import Embedding, PositionalEmbedding, FConvEncoder, FConvDecoder
+from . import FairseqEncoder, FairseqDecoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
+from .fconv import Embedding, PositionalEmbedding, LinearizedConv1d, FConvEncoder, FConvDecoder
 
 
-@register_model('align')
-class AlignModel(FairseqModel):
+@register_model('fconv_align')
+class FConvAlignModel(FairseqModel):
     def __init__(self, src_encoder, src_decoder, tgt_encoder, tgt_decoder):
         super().__init__(src_encoder, tgt_decoder) #For compatibility
         self.src_encoder = src_encoder
         self.src_decoder = src_decoder
         self.tgt_encoder = tgt_encoder
         self.tgt_decoder = tgt_decoder
+
         self.src_encoder.num_attention_layers = sum(layer is not None for layer in tgt_decoder.attention)
         self.tgt_encoder.num_attention_layers = sum(layer is not None for layer in src_decoder.attention)
 
@@ -61,7 +62,6 @@ class AlignModel(FairseqModel):
             convolutions=eval(args.encoder_layers),
             dropout=args.dropout,
             max_positions=args.max_source_positions,
-            left_pad=LanguagePairDataset.LEFT_PAD_SOURCE
         )
 
         tgt_encoder = FConvEncoder(
@@ -69,8 +69,7 @@ class AlignModel(FairseqModel):
             embed_dim=args.encoder_embed_dim,
             convolutions=eval(args.encoder_layers),
             dropout=args.dropout,
-            max_positions=args.max_target_positions,
-            left_pad=LanguagePairDataset.LEFT_PAD_TARGET
+            max_positions=args.max_source_positions,
         )
 
         src_decoder = FConvDecoder(
@@ -100,52 +99,29 @@ class AlignModel(FairseqModel):
         return cls(src_encoder, src_decoder, tgt_encoder, tgt_decoder)
 
     def forward(self, src_tokens, tgt_tokens, src_lengths, prev_src_tokens, prev_output_tokens):
-        #src_lengths is actually not used in encoders
+        bsz = src_tokens.size(0)
+        N,M = src_tokens.size(1),tgt_tokens.size(1)
+        T = max(N,M)
+
+        src_tokens = F.pad(src_tokens, (0,T-N))
+        tgt_tokens = F.pad(tgt_tokens, (0,T-M))
         src_encoder_out = self.src_encoder(src_tokens, src_lengths)
         tgt_encoder_out = self.tgt_encoder(tgt_tokens, src_lengths)
+        src_decoder_out, _ = self.src_decoder(prev_src_tokens, tgt_encoder_out)
+        tgt_decoder_out, _ = self.tgt_decoder(prev_output_tokens, src_encoder_out)
 
-        tgt_decoder_out, src_tgt_attn = self.tgt_decoder(prev_output_tokens, src_encoder_out)
-        src_decoder_out, tgt_src_attn = self.src_decoder(prev_src_tokens, tgt_encoder_out)
-        attn = Variable(src_tgt_attn.data.clone())
-        _,left_att = attn[0,:-1].max(dim=1)
-        _,right_att = attn[0,1:].max(dim=1)
-        attn = attn * 3
-        tvd,idx = (torch.abs(attn[0,:-1] - attn[0,1:])).max(dim=1)
-        print(torch.stack([left_att.float(),right_att.float(),tvd], dim=0))
-        #print(tvd.unsqueeze(1).t())
-        
-        return src_decoder_out, tgt_decoder_out
+        attn_score = (src_encoder_out[0].unsqueeze(1) * tgt_encoder_out[0].unsqueeze(2)).sum(dim=3)
+        target = Variable(torch.LongTensor(range(T))).cuda()
+        target = torch.stack([target] * bsz, dim=0)
+        if self.training:
+            align_loss = F.cross_entropy(attn_score, target) + F.cross_entropy(attn_score.transpose(1, 2), target)
+        else:
+            align_loss = 0
 
-class Embedder(FairseqEncoder):
-    def __init__(self, dictionary, embed_dim, dropout=0.1, max_positions=1024):
-        super().__init__(dictionary)
-        self.embed_dim = embed_dim
-        self.dropout = dropout
+        return src_decoder_out, tgt_decoder_out, align_loss * bsz
 
-        num_embeddings = len(dictionary)
-        padding_idx = dictionary.pad()
-        self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
-        self.embed_positions = PositionalEmbedding(max_positions, embed_dim, padding_idx, left_pad=LanguagePairDataset.LEFT_PAD_SOURCE)
 
-    def forward(self, src_tokens, src_lengths):
-        x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = GradMultiply.apply(x, 1.0 / (2.0 * self.num_attention_layers))
-        return x, x
-
-    def max_positions(self):
-        """Maximum input length supported by the encoder."""
-        return self.embed_positions.max_positions()
-
-def Linear(in_features, out_features, dropout=0, bias=True):
-    """Weight-normalized Linear layer (input: N x T x C)"""
-    m = nn.Linear(in_features, out_features, bias=bias)
-    m.weight.data.normal_(mean=0, std=0.1)
-    if bias:
-        m.bias.data.zero_()
-    return m
-
-@register_model_architecture('align', 'align')
+@register_model_architecture('fconv_align', 'fconv_align')
 def base_architecture(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(512, 3)] * 20')
@@ -156,13 +132,12 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
 
 
-@register_model_architecture('align', 'align_iwslt_de_en')
-def fconv_iwslt_de_en(args):
+@register_model_architecture('fconv_align', 'fconv_align_iwslt_de_en')
+def align_iwslt_de_en(args):
     base_architecture(args)
     args.encoder_embed_dim = 256
     args.encoder_layers = '[(256, 3)] * 4'
     args.decoder_embed_dim = 256
     args.decoder_layers = '[(256, 3)] * 3'
     args.decoder_out_embed_dim = 256
-    args.decoder_attention = '[True, False, False]'
 

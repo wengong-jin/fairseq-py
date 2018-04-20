@@ -234,6 +234,7 @@ class LanguagePairDataset(torch.utils.data.Dataset):
         prev_output_tokens = None
         target = None
         ntokens = None
+        src_ntokens = sum(len(s['source']) for s in samples)
         if has_target:
             target = merge('target', left_pad=LanguagePairDataset.LEFT_PAD_TARGET)
             # we create a shifted version of targets for feeding the
@@ -250,6 +251,7 @@ class LanguagePairDataset(torch.utils.data.Dataset):
         return {
             'id': id,
             'ntokens': ntokens,
+            'src_ntokens': src_ntokens,
             'net_input': {
                 'src_tokens': src_tokens,
                 'src_lengths': src_lengths,

@@ -45,6 +45,9 @@ class Trainer(object):
         self.meters = OrderedDict()
         self.meters['train_loss'] = AverageMeter()
         self.meters['train_nll_loss'] = AverageMeter()
+        self.meters['src_train_loss'] = AverageMeter()
+        self.meters['src_train_nll_loss'] = AverageMeter()
+        self.meters['reg_loss'] = AverageMeter()
         self.meters['valid_loss'] = AverageMeter()
         self.meters['valid_nll_loss'] = AverageMeter()
         self.meters['wps'] = TimeMeter()       # words per second
@@ -114,9 +117,15 @@ class Trainer(object):
         # update loss meters for training
         if 'loss' in agg_logging_output:
             self.meters['train_loss'].update(agg_logging_output['loss'], grad_denom)
+        if 'src_loss' in agg_logging_output:
+            self.meters['src_train_loss'].update(agg_logging_output['src_loss'], grad_denom)
         # criterions can optionally log the NLL loss too
         if 'nll_loss' in agg_logging_output:
             self.meters['train_nll_loss'].update(agg_logging_output['nll_loss'], ntokens)
+        if 'src_nll_loss' in agg_logging_output:
+            self.meters['src_train_nll_loss'].update(agg_logging_output['src_nll_loss'], ntokens)
+        if 'reg_loss' in agg_logging_output:
+            self.meters['reg_loss'].update(agg_logging_output['reg_loss'], ntokens)
 
         return agg_logging_output
 

@@ -128,7 +128,7 @@ def train(args, trainer, dataset, epoch, batch_offset):
     itr = itertools.islice(progress, batch_offset, None)
 
     # reset training meters
-    for k in ['train_loss', 'train_nll_loss', 'wps', 'ups', 'wpb', 'bsz', 'clip']:
+    for k in ['train_loss', 'train_nll_loss', 'src_train_loss', 'src_train_nll_loss', 'reg_loss', 'wps', 'ups', 'wpb', 'bsz', 'clip']:
         meter = trainer.get_meter(k)
         if meter is not None:
             meter.reset()
@@ -140,7 +140,7 @@ def train(args, trainer, dataset, epoch, batch_offset):
         # log mid-epoch stats
         stats = get_training_stats(trainer)
         for k, v in log_output.items():
-            if k in ['loss', 'nll_loss']:
+            if k in ['loss', 'nll_loss', 'reg_loss', 'src_loss']:
                 continue  # these are already logged above
             extra_meters[k].update(v)
             stats[k] = extra_meters[k].avg
@@ -163,12 +163,21 @@ def train(args, trainer, dataset, epoch, batch_offset):
 def get_training_stats(trainer):
     stats = collections.OrderedDict()
     stats['loss'] = '{:.3f}'.format(trainer.get_meter('train_loss').avg)
+
     if trainer.get_meter('train_nll_loss').count > 0:
         nll_loss = trainer.get_meter('train_nll_loss').avg
         stats['nll_loss'] = '{:.3f}'.format(nll_loss)
     else:
         nll_loss = trainer.get_meter('train_loss').avg
+    if trainer.get_meter('src_train_nll_loss').count > 0:
+        src_nll_loss = trainer.get_meter('src_train_nll_loss').avg
+        stats['src_nll_loss'] = '{:.3f}'.format(nll_loss)
+    else:
+        src_nll_loss = trainer.get_meter('src_train_loss').avg
+
+    stats['reg_loss'] = '{:.3f}'.format(trainer.get_meter('reg_loss').avg)
     stats['ppl'] = get_perplexity(nll_loss)
+    stats['src_ppl'] = get_perplexity(src_nll_loss)
     stats['wps'] = round(trainer.get_meter('wps').avg)
     stats['ups'] = '{:.1f}'.format(trainer.get_meter('ups').avg)
     stats['wpb'] = round(trainer.get_meter('wpb').avg)

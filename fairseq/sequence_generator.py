@@ -109,7 +109,6 @@ class SequenceGenerator(object):
                 incremental_states[model] = None
 
             # compute the encoder output for each beam
-            """
             encoder_out = model.encoder(
                 src_tokens.repeat(1, beam_size).view(-1, srclen),
                 src_lengths.repeat(beam_size),
@@ -120,6 +119,7 @@ class SequenceGenerator(object):
             z_encoder_out,_ = model.z_encoder(btokens, blen)
             z_decoder_out = model.z_decoder(z_encoder_out)
             encoder_out = model.encoder(z_decoder_out, blen)
+            """
 
             encoder_outs.append(encoder_out)
 

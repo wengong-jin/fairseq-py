@@ -17,11 +17,12 @@ from fairseq.modules import BeamableMM, GradMultiply, LearnedPositionalEmbedding
 
 from . import FairseqEncoder, FairseqDecoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
 from .fconv import Embedding, PositionalEmbedding, LinearizedConv1d, FConvEncoder, FConvDecoder
+from .uni_align import Controller
 
 
 @register_model('fast_align')
 class FastAlignModel(FairseqModel):
-    def __init__(self, src_embedding, src_controller, src_decoder, tgt_embedding, tgt_controller, tgt_decoder, all_encoder):
+    def __init__(self, src_embedding, src_controller, src_decoder, tgt_embedding, tgt_controller, tgt_decoder, all_encoder, align_file):
         super().__init__(src_embedding, tgt_decoder) #For compatibility
         self.src_embedding = src_embedding
         self.src_controller = src_controller
@@ -33,7 +34,19 @@ class FastAlignModel(FairseqModel):
 
         #tgt_decoder and src_decoder must have the same depth
         self.all_encoder.num_attention_layers = sum(layer is not None for layer in tgt_decoder.attention)
-        self.Ireg = False
+        
+        with open(align_file) as f:
+            self.align = [line.strip("\r\n ").split() for line in f]
+
+        self.align_label = []
+        for align in self.align:
+            align = [x.split('-') for x in align]
+            align = [(int(x[0]),int(x[1])) for x in align]
+            tgtlen = max([y for x,y in align]) + 1
+            align_mat = torch.zeros(tgtlen).long()
+            for x,y in align:
+                align_mat[y] = x
+            self.align_label.append(Variable(align_mat).cuda())
 
     @staticmethod
     def add_args(parser):
@@ -56,12 +69,14 @@ class FastAlignModel(FairseqModel):
                             help='share input and output embeddings (requires'
                                  ' --decoder-out-embed-dim and --decoder-embed-dim'
                                  ' to be equal)')
+        parser.add_argument('--align-file', type=str) 
 
     @classmethod
     def build_model(cls, args, src_dict, tgt_dict):
         """Build a new model instance."""
-        src_embedding = Embedder(src_dict, embed_dim=args.encoder_embed_dim)
-        tgt_embedding = Embedder(tgt_dict, embed_dim=args.encoder_embed_dim)
+        src_embedding = Embedder(src_dict, embed_dim=args.encoder_embed_dim, dropout=args.dropout)
+        tgt_embedding = Embedder(tgt_dict, embed_dim=args.encoder_embed_dim, dropout=args.dropout)
+        src_controller = Controller(embed_hdim=args.encoder_embed_dim, hdim=args.encoder_embed_dim, dropout=args.dropout)
         
         all_encoder = FConvEncoder(
             src_dict, #Just a dummy
@@ -94,14 +109,45 @@ class FastAlignModel(FairseqModel):
             share_embed=args.share_input_output_embed
         )
 
-        return cls(src_embedding, src_controller, src_decoder, tgt_embedding, tgt_controller, tgt_decoder, all_encoder)
+        return cls(src_embedding, src_controller, src_decoder, tgt_embedding, None, tgt_decoder, all_encoder, args.align_file)
 
-    def forward(self, src_tokens, tgt_tokens, src_lengths, prev_src_tokens, prev_output_tokens):
+    def forward(self, src_tokens, tgt_tokens, src_lengths, prev_src_tokens, prev_output_tokens, sent_ids):
         #src_lengths is actually not used 
         bsz = src_tokens.size(0)
+        M = tgt_tokens.size(1)
+        N = src_tokens.size(1)
+        print(N,M)
+
         src_x = self.src_embedding(src_tokens, src_lengths)
         tgt_x = self.tgt_embedding(tgt_tokens, src_lengths)
+        src_x, attn_ac = self.src_controller(src_x, M) #B * M * N
 
+        if self.training:
+            align_label = [self.align_label[i] for i in sent_ids]
+            max_len = max([x.size(0) for x in align_label])
+            for i,amat in enumerate(align_label):
+                pad_len = max_len - amat.size(0) + 1 #plus 1 for </s>
+                align_label[i] = F.pad(amat, (0,pad_len), value=src_lengths[i] - 1) #attend to the last position for padding
+            align_label = torch.cat(align_label, dim=0)
+            align_loss = F.nll_loss(attn_ac.view(-1,N), align_label)
+            dist_loss = F.mse_loss(src_x, tgt_x) * bsz 
+
+            """
+            for i,amat in enumerate(align_label):
+                padC,padR = N - amat.size(1), M - amat.size(0)
+                padC,padR = max(0,padC), max(0,padR)
+                align_label[i] = F.pad(amat, (0,padC,0,padR) )
+            align_label = torch.stack(align_label, dim=0)
+            #size_average takes mean over all dimensions
+            align_loss = F.binary_cross_entropy(attn_ac, align_label) * bsz
+            """
+        else:
+            align_loss,dist_loss = 0,0
+
+        #print(torch.norm(src_x[0] - tgt_x[0], p=1, dim=1) / 256)
+        #xx,yy = attn_ac[0].max(dim=1)
+        #print(torch.stack([xx,yy.float()],dim=1))
+        #print(self.align[sent_ids[0]])
         
         src_encoder_out = self.all_encoder(src_x, src_lengths)
         tgt_encoder_out = self.all_encoder(tgt_x, src_lengths)
@@ -109,27 +155,7 @@ class FastAlignModel(FairseqModel):
         tgt_decoder_out,attn_cb = self.tgt_decoder(prev_output_tokens, src_encoder_out)
         src_decoder_out,attn_ca = self.src_decoder(prev_src_tokens, tgt_encoder_out)
 
-        reg = F.mse_loss(src_x, tgt_x) * bsz #size_average takes mean over all dimensions
-        #print("%.6f" % (reg.data.item() / bsz))
-
-        if self.Ireg and self.training:
-            attn_aa = torch.bmm(attn_ca, attn_ac)
-            attn_bb = torch.bmm(attn_cb, attn_bc)
-            I_a = Variable(torch.eye(src_tokens.size(1))).cuda()
-            I_b = Variable(torch.eye(tgt_tokens.size(1))).cuda()
-            I_a = torch.stack([I_a] * bsz, dim=0)
-            I_b = torch.stack([I_b] * bsz, dim=0)
-            Ireg = F.mse_loss(attn_aa, I_a) + F.mse_loss(attn_bb, I_b)
-            reg += Ireg * bsz
-        
-        attn_aa = torch.bmm(attn_ca, attn_ac)
-        attn_bb = torch.bmm(attn_cb, attn_bc)
-        xx,yy = attn_ac[0].max(dim=1)
-        xx1,yy1 = attn_bc[0].max(dim=1)
-        #print(torch.stack([xx,yy.float(),xx1,yy1.float()],dim=1))
-        print(attn_aa[0])
-
-        return src_decoder_out, tgt_decoder_out, reg
+        return src_decoder_out, tgt_decoder_out, align_loss + dist_loss
 
 class Embedder(FairseqEncoder):
     def __init__(self, dictionary, embed_dim, dropout=0.1, max_positions=1024):
