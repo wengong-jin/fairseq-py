@@ -45,7 +45,7 @@ class UniCrossEntropyCriterion(FairseqCriterion):
         target = src_tokens.view(-1)
         src_loss = F.nll_loss(lprobs, target, size_average=False, ignore_index=self.padding_idx, reduce=reduce)
 
-        loss = 0.5 * src_loss + 0.5 * tgt_loss + 100 * reg_loss
+        loss = 0.5 * src_loss + 0.5 * tgt_loss + reg_loss
         
         sample_size = sample['target'].size(0) if self.args.sentence_avg else sample['ntokens'] 
         src_sample_size = sample['source'].size(0) if self.args.sentence_avg else sample['src_ntokens'] 
